@@ -95,16 +95,14 @@ def _get_client() -> DeepSeekR1Client:
     return _client
 
 
-# ---------------------------------------------------------------------------
-# Signal extraction
-# ---------------------------------------------------------------------------
 
 _EXTRACT_SYSTEM = """\
 You are a signal extractor for a B2B sales cold-call. Output only valid json.
 
 Extract from the user's latest message:
 {"intent":"answer|objection|end|off_topic","company_size":null,"pain":null,\
-"budget":null,"authority":null,"timeline":null,"objection_type":null,"confidence":0.5}
+"budget":null,"authority":null,"timeline":null,"objection_type":null,\
+"confidence":0.5,"answered_slot":null,"is_correction":false}
 
 Field rules:
 - intent: "answer" (sharing info), "objection" (pushback), "end" (goodbye/hangup), "off_topic"
@@ -115,9 +113,13 @@ Field rules:
 - timeline: short string ("this quarter","Q2","asap") or null
 - objection_type: "not_interested"|"already_have_tool"|"too_expensive"|"send_email"|"busy"|"other" or null
 - confidence: 0.0-1.0 overall extraction confidence
+- answered_slot: which BANT+ slot this utterance answers — one of "pain","company_size","authority","budget","timeline" or null. \
+Set this when the user is clearly providing info about a specific slot. For filler words ("yeah","ok","sure") set null.
+- is_correction: true if the user is explicitly correcting a previous answer ("actually we're 200", "sorry I meant", "no it's")
 
 Example: {"intent":"answer","company_size":50,"pain":7,"budget":null,\
-"authority":true,"timeline":"this quarter","objection_type":null,"confidence":0.85}"""
+"authority":true,"timeline":"this quarter","objection_type":null,"confidence":0.85,\
+"answered_slot":"company_size","is_correction":false}"""
 
 
 async def extract_signals_llm(
@@ -142,6 +144,9 @@ async def extract_signals_llm(
     )
     if known:
         context += f", Known: {json.dumps(known)}"
+    last_asked = state_snapshot.get("last_asked_slot")
+    if last_asked:
+        context += f", Agent just asked about: {last_asked}"
 
     messages = [
         {"role": "system", "content": _EXTRACT_SYSTEM},
@@ -150,6 +155,14 @@ async def extract_signals_llm(
 
     data = await client.chat_json(messages, max_tokens=200)
     logger.debug("Session %s LLM extraction raw: %s", session_id, data)
+
+    answered_slot_raw = data.get("answered_slot")
+    answered_slot = (
+        answered_slot_raw
+        if isinstance(answered_slot_raw, str)
+        and answered_slot_raw in ("pain", "company_size", "authority", "budget", "timeline")
+        else None
+    )
 
     return ExtractedSignals(
         intent=str(data.get("intent", "answer")),
@@ -168,6 +181,8 @@ async def extract_signals_llm(
             else None
         ),
         confidence=float(data.get("confidence", 0.5)),
+        answered_slot=answered_slot,
+        is_correction=bool(data.get("is_correction", False)),
     )
 
 

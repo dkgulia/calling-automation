@@ -73,6 +73,8 @@ class ExtractedSignals:
         timeline: freeform timeline string if mentioned
         objection_type: specific objection category if intent == "objection"
         confidence: how confident we are in this extraction (0-1)
+        answered_slot: which slot this utterance answers (alignment gating)
+        is_correction: True if user is explicitly correcting a prior answer
     """
     intent: str = "answer"  # "answer" | "objection" | "end" | "off_topic"
     company_size: int | None = None
@@ -82,6 +84,8 @@ class ExtractedSignals:
     timeline: str | None = None
     objection_type: str | None = None
     confidence: float = 0.5
+    answered_slot: str | None = None
+    is_correction: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -93,6 +97,8 @@ class ExtractedSignals:
             "timeline": self.timeline,
             "objection_type": self.objection_type,
             "confidence": self.confidence,
+            "answered_slot": self.answered_slot,
+            "is_correction": self.is_correction,
         }
 
 
@@ -126,6 +132,17 @@ _END_PATTERNS: list[str] = [
 ]
 
 
+_CORRECTION_PATTERNS: list[str] = [
+    r"\bactually\b",
+    r"\bsorry\b.*\b(?:meant|mean)\b",
+    r"\bi mean\b",
+    r"\bcorrection\b",
+    r"\bno[, ]+it'?s\b",
+    r"\blet me correct\b",
+    r"\bwait[, ]+(?:it'?s|we'?re|i'?m)\b",
+]
+
+
 def extract_signals_rule_based(user_text: str) -> ExtractedSignals:
     """
     Cheap, deterministic signal extraction using keyword heuristics.
@@ -138,6 +155,12 @@ def extract_signals_rule_based(user_text: str) -> ExtractedSignals:
     """
     text = user_text.lower().strip()
     signals = ExtractedSignals()
+
+    # --- Detect correction intent ---
+    for pattern in _CORRECTION_PATTERNS:
+        if re.search(pattern, text):
+            signals.is_correction = True
+            break
 
     # --- Check for end-of-call intent ---
     for pattern in _END_PATTERNS:
@@ -260,9 +283,13 @@ class ProspectState:
         "timeline": None,
     })
     objections: list[str] = field(default_factory=list)
+    objection_counts: dict[str, int] = field(default_factory=dict)
     interest_score: float = 0.0  # starts at zero; evidence-based scoring only
     last_user_text: str | None = None
     last_agent_text: str | None = None
+    last_asked_slot: str | None = None
+    slot_confidences: dict[str, float] = field(default_factory=dict)
+    slot_sources: dict[str, str] = field(default_factory=dict)
 
     def missing_slots(self) -> list[str]:
         """Return slot names that haven't been filled yet, in priority order."""
@@ -273,35 +300,86 @@ class ProspectState:
         return [s for s in QUALIFICATION_SLOTS if self.learned_fields.get(s) is not None]
 
     def update_from_signals(
-        self, signals: ExtractedSignals, min_confidence: float = 0.0
+        self,
+        signals: ExtractedSignals,
+        min_confidence: float = 0.0,
+        extracted_source: str = "rule_based",
     ) -> None:
         """
         Merge extracted signals into learned_fields.
 
-        Confidence gating (Phase 4): a slot is only filled when:
+        Confidence gating: a slot is only filled when:
           - the signal value is not None
-          - the slot is currently None (never overwrite learned values)
           - signals.confidence >= min_confidence
+          - alignment check passes (if last_asked_slot is set)
 
-        Objections are always appended (if not duplicate) regardless of
-        confidence, because objection intent itself is the important signal.
+        Overwrite rule for already-filled slots:
+          - Only if confidence >= min_confidence AND
+            (is_correction OR new confidence > prev + 0.25 when prev < 0.85)
+          - Never overwrite with None
+
+        Objections are always recorded regardless of confidence.
         """
         meets_confidence = signals.confidence >= min_confidence
 
         if meets_confidence:
-            if signals.company_size is not None and self.learned_fields["company_size"] is None:
-                self.learned_fields["company_size"] = signals.company_size
-            if signals.pain is not None and self.learned_fields["pain"] is None:
-                self.learned_fields["pain"] = signals.pain
-            if signals.budget is not None and self.learned_fields["budget"] is None:
-                self.learned_fields["budget"] = signals.budget
-            if signals.authority is not None and self.learned_fields["authority"] is None:
-                self.learned_fields["authority"] = signals.authority
-            if signals.timeline is not None and self.learned_fields["timeline"] is None:
-                self.learned_fields["timeline"] = signals.timeline
+            slot_values: list[tuple[str, Any]] = [
+                ("company_size", signals.company_size),
+                ("pain", signals.pain),
+                ("budget", signals.budget),
+                ("authority", signals.authority),
+                ("timeline", signals.timeline),
+            ]
 
-        if signals.objection_type and signals.objection_type not in self.objections:
-            self.objections.append(signals.objection_type)
+            # Count how many slots have explicit data — if 2+, the user gave
+            # a substantive multi-info answer (not filler) and all should fill.
+            explicit_count = sum(1 for _, v in slot_values if v is not None)
+
+            for slot_name, new_val in slot_values:
+                if new_val is None:
+                    continue
+                # Alignment gating: if we asked a specific slot, only accept
+                # fills for that slot unless confidence is very high, or the
+                # user provided multiple slot values (substantive answer).
+                # Corrections always bypass alignment gating.
+                if self.last_asked_slot is not None and not signals.is_correction:
+                    if (
+                        signals.answered_slot != self.last_asked_slot
+                        and slot_name != self.last_asked_slot
+                        and signals.confidence < 0.85
+                        and explicit_count < 2
+                    ):
+                        continue
+
+                current_val = self.learned_fields[slot_name]
+                if current_val is None:
+                    # Empty slot — fill it
+                    self.learned_fields[slot_name] = new_val
+                    self.slot_confidences[slot_name] = signals.confidence
+                    self.slot_sources[slot_name] = extracted_source
+                else:
+                    # Already filled — allow overwrite only on correction
+                    # or substantially higher confidence
+                    prev_conf = self.slot_confidences.get(slot_name, 0.5)
+                    allow = (
+                        signals.is_correction
+                        or (
+                            signals.confidence >= (prev_conf + 0.25)
+                            and prev_conf < 0.85
+                        )
+                    )
+                    if allow:
+                        self.learned_fields[slot_name] = new_val
+                        self.slot_confidences[slot_name] = signals.confidence
+                        self.slot_sources[slot_name] = extracted_source
+
+        # Always track objections (unique list + counts)
+        if signals.objection_type:
+            self.objection_counts[signals.objection_type] = (
+                self.objection_counts.get(signals.objection_type, 0) + 1
+            )
+            if signals.objection_type not in self.objections:
+                self.objections.append(signals.objection_type)
 
 
 # ---------------------------------------------------------------------------

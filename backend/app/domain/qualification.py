@@ -67,13 +67,15 @@ def score_opportunity(state: ProspectState, signals: ExtractedSignals) -> float:
     if timeline is not None and timeline != "unknown":
         score += 1.0
 
-    # --- Objection penalties (capped at -2 total) ---
+    # --- Objection penalties (diminishing + capped at -2 total) ---
     objection_penalty = 0.0
     for obj in state.objections:
+        count = state.objection_counts.get(obj, 1)
+        multiplier = 1.0 if count == 1 else 0.5 if count == 2 else 0.0
         if obj in _STRONG_OBJECTIONS:
-            objection_penalty += 1.0
+            objection_penalty += 1.0 * multiplier
         elif obj in _MILD_OBJECTIONS:
-            objection_penalty += 0.5
+            objection_penalty += 0.5 * multiplier
     score -= min(objection_penalty, 2.0)
 
     # --- Clamp to 0-10 ---
@@ -123,12 +125,26 @@ def score_breakdown(state: ProspectState) -> list[dict]:
     objection_penalty = 0.0
     obj_items: list[dict] = []
     for obj in state.objections:
+        count = state.objection_counts.get(obj, 1)
+        multiplier = 1.0 if count == 1 else 0.5 if count == 2 else 0.0
         if obj in _STRONG_OBJECTIONS:
-            obj_items.append({"field": "objection", "points": -1.0, "reason": f"Objection: {obj}"})
-            objection_penalty += 1.0
+            base = -1.0
+            applied = base * multiplier
+            obj_items.append({
+                "field": "objection",
+                "points": applied,
+                "reason": f"Objection: {obj} (x{count}, penalty {applied:+.1f})",
+            })
+            objection_penalty += abs(applied)
         elif obj in _MILD_OBJECTIONS:
-            obj_items.append({"field": "objection", "points": -0.5, "reason": f"Mild objection: {obj}"})
-            objection_penalty += 0.5
+            base = -0.5
+            applied = base * multiplier
+            obj_items.append({
+                "field": "objection",
+                "points": applied,
+                "reason": f"Mild objection: {obj} (x{count}, penalty {applied:+.1f})",
+            })
+            objection_penalty += abs(applied)
 
     # Cap total penalty at -2
     if objection_penalty > 2.0 and obj_items:

@@ -107,8 +107,12 @@ async def process_input(session_id: str, user_text: str) -> dict:
     score_before = state.interest_score
     objections_before = set(state.objections)  # capture BEFORE update
 
-    # --- 3. Merge signals (confidence-gated) ---
-    state.update_from_signals(signals, min_confidence=settings.llm_min_confidence)
+    # --- 3. Merge signals (confidence-gated + alignment-gated) ---
+    state.update_from_signals(
+        signals,
+        min_confidence=settings.llm_min_confidence,
+        extracted_source=extracted_source,
+    )
 
     # --- 4. Recompute score ---
     score_after = score_opportunity(state, signals)
@@ -116,6 +120,12 @@ async def process_input(session_id: str, user_text: str) -> dict:
 
     # --- 5. Decide next action ---
     action = decide_next_action(state, signals, prior_objections=objections_before)
+
+    # --- 5b. Track which slot we just asked (for alignment gating) ---
+    if action.type == "ASK_SLOT" and action.slot:
+        state.last_asked_slot = action.slot
+    else:
+        state.last_asked_slot = None
 
     # --- 6. Transition stage ---
     stage_before = state.stage
@@ -221,6 +231,7 @@ def _state_snapshot(state: ProspectState) -> dict:
         "turn_count": state.turn_count,
         "last_agent_text": state.last_agent_text,
         "last_user_text": state.last_user_text,
+        "last_asked_slot": state.last_asked_slot,
     }
 
 
