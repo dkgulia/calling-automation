@@ -214,22 +214,29 @@ class PcmPlayer {
   private chunksLen = 0;
   private inputRate = 24000;
   private flushTimer: number | null = null;
+  private activeSources: AudioBufferSourceNode[] = [];
   // Batch 500ms of audio (12000 samples @ 24kHz) before scheduling.
-  // This means only ~2 AudioBufferSourceNode creations per second,
-  // virtually eliminating scheduling gaps.
   private readonly MIN_BUFFER = 12000;
+  // If nextTime is more than this far ahead of now, old audio from an
+  // interrupted utterance is blocking — cancel it and play immediately.
+  private readonly STALE_THRESHOLD_S = 1.5;
 
   constructor() {
     this.ctx = new AudioContext();
+    // Eagerly resume — browsers may create it in "suspended" state.
+    // Called within user gesture (button click) so this is allowed.
+    this.ctx.resume();
   }
 
   play(pcm16: Uint8Array, sampleRate: number) {
     if (this.ctx.state === "suspended") this.ctx.resume();
     this.inputRate = sampleRate || 24000;
 
-    const samples = new Int16Array(
-      pcm16.buffer, pcm16.byteOffset, pcm16.byteLength / 2,
-    );
+    // Copy into an aligned buffer — the subarray from protobuf decoding may
+    // have an odd byteOffset which causes Int16Array to throw RangeError.
+    const aligned = new Uint8Array(pcm16.length);
+    aligned.set(pcm16);
+    const samples = new Int16Array(aligned.buffer, 0, aligned.length / 2);
     const float32 = new Float32Array(samples.length);
     for (let i = 0; i < samples.length; i++) float32[i] = samples[i] / 32768;
 
@@ -242,6 +249,15 @@ class PcmPlayer {
       // Flush after 100ms for end-of-utterance tail
       this.flushTimer = window.setTimeout(() => this.flush(), 100);
     }
+  }
+
+  /** Cancel all scheduled audio and reset timing. */
+  private cancelScheduled() {
+    for (const src of this.activeSources) {
+      try { src.stop(); } catch { /* already stopped */ }
+    }
+    this.activeSources = [];
+    this.nextTime = 0;
   }
 
   private flush() {
@@ -268,13 +284,32 @@ class PcmPlayer {
     src.connect(this.ctx.destination);
 
     const now = this.ctx.currentTime;
-    if (this.nextTime < now) this.nextTime = now + 0.2; // 200ms headroom
+    if (this.nextTime < now) {
+      // Fallen behind — start with small headroom
+      this.nextTime = now + 0.05;
+    } else if (this.nextTime > now + this.STALE_THRESHOLD_S) {
+      // nextTime is far in the future — stale audio from an interrupted
+      // utterance (barge-in). Cancel old audio, play new audio immediately.
+      this.cancelScheduled();
+      this.nextTime = now + 0.05;
+    }
+
     src.start(this.nextTime);
     this.nextTime += merged.length / this.inputRate;
+
+    // Track source for cleanup; remove when playback finishes naturally
+    this.activeSources.push(src);
+    src.onended = () => {
+      const idx = this.activeSources.indexOf(src);
+      if (idx !== -1) this.activeSources.splice(idx, 1);
+    };
   }
 
   stop() {
     if (this.flushTimer) clearTimeout(this.flushTimer);
+    this.cancelScheduled();
+    this.chunks = [];
+    this.chunksLen = 0;
     try { this.ctx.close(); } catch { /* ignore */ }
   }
 }
@@ -312,6 +347,7 @@ export function Home() {
   const voiceRef = useRef<VoiceResources | null>(null);
   const sessionIdRef = useRef<string>("");
   const abortRef = useRef(false);
+  const callEndedRef = useRef(false);
   const turnLogEndRef = useRef<HTMLDivElement>(null);
 
   // Auto-scroll turn log when new entries arrive
@@ -320,6 +356,8 @@ export function Home() {
   }, [turnLog]);
 
   const handleCallEnded = useCallback(async () => {
+    if (callEndedRef.current) return; // prevent double-calling
+    callEndedRef.current = true;
     const sid = sessionIdRef.current;
     if (!sid) return;
     setCallStatus("ended");
@@ -343,6 +381,7 @@ export function Home() {
 
   // --- Voice call (human prospect mode) — raw WebSocket + getUserMedia ---
   const startVoiceCall = useCallback(async () => {
+    callEndedRef.current = false;
     setCallStatus("starting");
     setStatusText("Starting session...");
     setOutcome(null);
@@ -383,7 +422,10 @@ export function Home() {
       const actualRate = micCtx.sampleRate;
 
       const source = micCtx.createMediaStreamSource(micStream);
-      // ScriptProcessorNode: 512 samples per callback, mono
+      // ScriptProcessorNode is deprecated in favor of AudioWorkletNode, but
+      // AudioWorklet requires a separate JS file served with correct CORS
+      // headers and adds deployment complexity. For this prototype,
+      // ScriptProcessor is simpler and works reliably across browsers.
       const scriptNode = micCtx.createScriptProcessor(512, 1, 1);
 
       scriptNode.onaudioprocess = (e) => {
@@ -413,24 +455,37 @@ export function Home() {
         setStatusText("In call — speak to the agent");
       };
 
+      let audioFrameCount = 0;
       ws.onmessage = (event) => {
-        const buf = new Uint8Array(event.data as ArrayBuffer);
-        const parsed = decodeFrame(buf);
-        if (!parsed) return;
-
-        if (parsed.type === "audio") {
-          player.play(parsed.audio, parsed.sampleRate);
-        } else if (parsed.type === "message") {
-          const d = parsed.data as Record<string, unknown>;
-          if (d.type === "bot-ready") {
-            setStatusText("Agent ready — listening...");
+        try {
+          const buf = new Uint8Array(event.data as ArrayBuffer);
+          const parsed = decodeFrame(buf);
+          if (!parsed) {
+            console.log("[ws] unparsed frame, bytes:", buf.length);
+            return;
           }
-        } else if (parsed.type === "text" && parsed.text.trim()) {
-          // Agent response text from _TranscriptSender
-          setTurnLog((prev) => [...prev, { role: "agent", text: parsed.text }]);
-        } else if (parsed.type === "transcription" && parsed.text.trim()) {
-          // User speech transcription from _TranscriptSender
-          setTurnLog((prev) => [...prev, { role: "prospect", text: parsed.text }]);
+
+          if (parsed.type === "audio") {
+            audioFrameCount++;
+            if (audioFrameCount <= 3 || audioFrameCount % 50 === 0) {
+              console.log(`[ws] audio frame #${audioFrameCount}, bytes:${parsed.audio.length}, rate:${parsed.sampleRate}`);
+            }
+            player.play(parsed.audio, parsed.sampleRate);
+          } else if (parsed.type === "message") {
+            const d = parsed.data as Record<string, unknown>;
+            console.log("[ws] message:", d.type);
+            if (d.type === "bot-ready") {
+              setStatusText("Agent ready — listening...");
+            }
+          } else if (parsed.type === "text" && parsed.text.trim()) {
+            console.log("[ws] agent text:", parsed.text.slice(0, 60));
+            setTurnLog((prev) => [...prev, { role: "agent", text: parsed.text }]);
+          } else if (parsed.type === "transcription" && parsed.text.trim()) {
+            console.log("[ws] user transcription:", parsed.text.slice(0, 60));
+            setTurnLog((prev) => [...prev, { role: "prospect", text: parsed.text }]);
+          }
+        } catch (err) {
+          console.error("ws.onmessage error:", err);
         }
       };
 
@@ -452,6 +507,7 @@ export function Home() {
 
   // --- AI simulation (ai prospect mode) ---
   const startAiSimulation = useCallback(async () => {
+    callEndedRef.current = false;
     setCallStatus("starting");
     setStatusText("Starting AI simulation...");
     setOutcome(null);
@@ -518,7 +574,8 @@ export function Home() {
     cleanupVoice(voiceRef.current);
     voiceRef.current = null;
     abortRef.current = true;
-  }, []);
+    handleCallEnded();
+  }, [handleCallEnded]);
 
   const handleStart = useCallback(() => {
     if (prospectMode === "human") {
@@ -607,7 +664,7 @@ export function Home() {
             : "Starting..."}
         </button>
 
-        {callStatus === "in-call" && (
+        {(callStatus === "connecting" || callStatus === "in-call") && (
           <button
             onClick={endCall}
             style={{

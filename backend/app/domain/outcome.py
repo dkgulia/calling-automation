@@ -10,12 +10,10 @@ from __future__ import annotations
 
 from app.domain.qualification import (
     label_from_score,
-    score_opportunity,
     score_opportunity_with_breakdown,
 )
 from app.domain.state import (
     DecisionTrace,
-    ExtractedSignals,
     ProspectState,
 )
 
@@ -33,9 +31,7 @@ def build_outcome(state: ProspectState, trace: DecisionTrace) -> dict:
       decision_trace       — condensed list of per-turn decisions
     """
     # Compute final score with breakdown
-    final_score, breakdown, explanation = score_opportunity_with_breakdown(
-        state, ExtractedSignals()
-    )
+    final_score, breakdown, explanation = score_opportunity_with_breakdown(state)
     label = label_from_score(final_score)
     next_action = _recommended_next_action(state, final_score, label)
     summary = _build_summary(state, final_score, label, next_action, trace)

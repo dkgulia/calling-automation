@@ -31,29 +31,9 @@ def decide_next_action(
     signals: ExtractedSignals,
     prior_objections: set[str] | None = None,
 ) -> Action:
-    """
-    Given the current state and freshly-extracted signals, decide what the
-    agent should do next.
-
-    Decision priority (highest to lowest):
-      1. Explicit end signal or turn limit  -> END
-      2. Weak-lead bail-out                 -> END
-      3. Objection detected (new only)      -> HANDLE_OBJECTION (max 2 total)
-      4. All key slots filled + strong lead -> CLOSE
-      5. Missing slots remain               -> ASK_SLOT (best next slot)
-      6. Fallback                           -> END (nothing left to do)
-
-    Args:
-        prior_objections: objections already in state BEFORE this turn's update.
-            Used to determine if the current objection is new or already handled.
-
-    Returns an Action with type, optional slot, message_goal, and reason_codes
-    that explain *why* this action was chosen.
-    """
     reasons: list[str] = []
     _prior = prior_objections if prior_objections is not None else set()
 
-    # --- 1. Hard stop: user wants to end, or we've hit the turn limit ---
     if signals.intent == "end":
         reasons.append("USER_ENDED")
         return Action(
@@ -70,7 +50,15 @@ def decide_next_action(
             reason_codes=reasons,
         )
 
-    # --- 2. Weak-lead bail-out: all slots filled but score too low ---
+    # --- 2a. Close accepted: we proposed a next step last turn, prospect didn't object ---
+    if state.stage == CallStage.CLOSE and signals.intent != "objection":
+        reasons.append("CLOSE_ACCEPTED")
+        return Action(
+            type="END",
+            message_goal="Confirm the next step, thank them, and say a friendly goodbye",
+            reason_codes=reasons,
+        )
+
     missing = state.missing_slots()
     if not missing and state.interest_score < 4:
         reasons.append("ALL_SLOTS_FILLED")
@@ -81,9 +69,7 @@ def decide_next_action(
             reason_codes=reasons,
         )
 
-    # --- 3. Handle objection (only if NEW and we haven't handled too many) ---
     if signals.intent == "objection" and signals.objection_type:
-        # "Busy" / callback requests → always respect and end call gracefully
         if signals.objection_type == "busy":
             reasons.append("CALLBACK_REQUESTED")
             return Action(
@@ -92,7 +78,7 @@ def decide_next_action(
                 reason_codes=reasons,
             )
         is_new = signals.objection_type not in _prior
-        total_handled = len(_prior)  # how many objections handled before this turn
+        total_handled = len(_prior)
         if is_new and total_handled < 2:
             reasons.append(f"OBJECTION_{signals.objection_type.upper()}")
             return Action(
@@ -100,10 +86,8 @@ def decide_next_action(
                 message_goal=_objection_goal(signals.objection_type),
                 reason_codes=reasons,
             )
-        # Already handled or hit objection cap — fall through to slot probing
         reasons.append(f"OBJECTION_SKIPPED_{signals.objection_type.upper()}")
 
-    # --- 4. All key slots filled + strong enough score -> close ---
     if not missing and state.interest_score >= 6:
         reasons.append("ALL_SLOTS_FILLED")
         reasons.append("SCORE_STRONG_ENOUGH")
@@ -113,9 +97,7 @@ def decide_next_action(
             reason_codes=reasons,
         )
 
-    # --- 5. Probe next missing slot ---
     if missing:
-        # In INTRO stage, always start with pain to transition to DISCOVERY
         if state.stage == CallStage.INTRO:
             next_slot = "pain"
             reasons.append("INTRO_TO_DISCOVERY")
@@ -139,20 +121,7 @@ def decide_next_action(
     )
 
 
-# ---------------------------------------------------------------------------
-# Stage transitions
-# ---------------------------------------------------------------------------
-
 def next_stage_from_action(current: CallStage, action: Action) -> CallStage:
-    """
-    Determine the next CallStage based on the chosen action.
-
-    Stage machine:
-      ASK_SLOT          -> DISCOVERY (from INTRO) or QUALIFY
-      HANDLE_OBJECTION  -> OBJECTION
-      CLOSE             -> CLOSE
-      END               -> END
-    """
     if action.type == "END":
         return CallStage.END
 
@@ -165,24 +134,18 @@ def next_stage_from_action(current: CallStage, action: Action) -> CallStage:
     if action.type == "ASK_SLOT":
         if current == CallStage.INTRO:
             return CallStage.DISCOVERY
-        # After handling an objection, go back to qualifying
         if current == CallStage.OBJECTION:
             return CallStage.QUALIFY
         return CallStage.QUALIFY
 
     return current  # no change
 
-
 # ---------------------------------------------------------------------------
 # Human-readable goal text
 # ---------------------------------------------------------------------------
 
 def agent_goal_for_action(action: Action, state: ProspectState) -> str:
-    """
-    Produce a short, human-readable goal string describing what the agent
-    should accomplish in its next utterance.  This feeds into the LLM system
-    prompt in later phases.
-    """
+
     if action.type == "END":
         return action.message_goal
 
@@ -207,17 +170,10 @@ def agent_goal_for_action(action: Action, state: ProspectState) -> str:
 # ---------------------------------------------------------------------------
 
 def _pick_best_slot(missing: list[str], state: ProspectState) -> str:
-    """
-    Choose the next slot to probe from the missing list.
 
-    Uses SLOT_PRIORITY order but skips slots that are unlikely to yield
-    answers right now (e.g., don't ask budget before establishing pain).
-    """
-    # Default: follow priority order
     for slot in SLOT_PRIORITY:
         if slot in missing:
             return slot
-    # Shouldn't happen, but just in case
     return missing[0]
 
 

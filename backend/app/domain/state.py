@@ -25,17 +25,6 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 class CallStage(Enum):
-    """
-    Conversation phases.  Transitions are managed by the decision engine
-    (see decision_engine.next_stage_from_action).
-
-    INTRO      -> opening, rapport building
-    DISCOVERY  -> open-ended probing (pain, workflow)
-    QUALIFY    -> explicit BANT slot-filling
-    OBJECTION  -> handling pushback
-    CLOSE      -> asking for next step (demo, meeting)
-    END        -> call is over
-    """
     INTRO = "INTRO"
     DISCOVERY = "DISCOVERY"
     QUALIFY = "QUALIFY"
@@ -52,30 +41,11 @@ QUALIFICATION_SLOTS = ("pain", "company_size", "authority", "budget", "timeline"
 SLOT_PRIORITY = ["pain", "company_size", "authority", "budget", "timeline"]
 
 
-# ---------------------------------------------------------------------------
 # Extracted signals — output of analyzing one user utterance
-# ---------------------------------------------------------------------------
 
 @dataclass
 class ExtractedSignals:
-    """
-    Structured signals extracted from a single user utterance.
 
-    In Phase 1 these come from rule-based keyword matching.
-    In later phases, Claude will produce these via structured extraction.
-
-    Fields:
-        intent: high-level classification of what the user is doing
-        company_size: employee count if mentioned (None = not mentioned)
-        pain: pain severity 0-10 if expressed (None = not mentioned)
-        budget: True if budget is available, False if rejected, None if unknown
-        authority: True if speaker is decision-maker, None if unknown
-        timeline: freeform timeline string if mentioned
-        objection_type: specific objection category if intent == "objection"
-        confidence: how confident we are in this extraction (0-1)
-        answered_slot: which slot this utterance answers (alignment gating)
-        is_correction: True if user is explicitly correcting a prior answer
-    """
     intent: str = "answer"  # "answer" | "objection" | "end" | "off_topic"
     company_size: int | None = None
     pain: int | None = None
@@ -102,9 +72,7 @@ class ExtractedSignals:
         }
 
 
-# ---------------------------------------------------------------------------
 # Rule-based signal extractor (Phase 1 only)
-# ---------------------------------------------------------------------------
 
 # Objection patterns: (regex, objection_type)
 _OBJECTION_PATTERNS: list[tuple[str, str]] = [
@@ -144,15 +112,7 @@ _CORRECTION_PATTERNS: list[str] = [
 
 
 def extract_signals_rule_based(user_text: str) -> ExtractedSignals:
-    """
-    Cheap, deterministic signal extraction using keyword heuristics.
 
-    This is intentionally simple — the goal is a working pipeline that can be
-    swapped for Claude-based extraction in Phase 2 without changing the
-    downstream decision engine at all.
-
-    Tradeoff: low recall on nuanced language, but zero latency and no API cost.
-    """
     text = user_text.lower().strip()
     signals = ExtractedSignals()
 
@@ -263,15 +223,6 @@ def extract_signals_rule_based(user_text: str) -> ExtractedSignals:
 
 @dataclass
 class ProspectState:
-    """
-    Everything we know about the prospect and the call so far.
-
-    This is the central state object that flows through:
-      extract_signals -> score_opportunity -> decide_next_action -> build_outcome
-
-    Design note: learned_fields uses a flat dict with None values instead of
-    nested optionals, making it trivial to count filled slots and serialize.
-    """
     session_id: str = ""
     stage: CallStage = CallStage.INTRO
     turn_count: int = 0
@@ -305,21 +256,6 @@ class ProspectState:
         min_confidence: float = 0.0,
         extracted_source: str = "rule_based",
     ) -> None:
-        """
-        Merge extracted signals into learned_fields.
-
-        Confidence gating: a slot is only filled when:
-          - the signal value is not None
-          - signals.confidence >= min_confidence
-          - alignment check passes (if last_asked_slot is set)
-
-        Overwrite rule for already-filled slots:
-          - Only if confidence >= min_confidence AND
-            (is_correction OR new confidence > prev + 0.25 when prev < 0.85)
-          - Never overwrite with None
-
-        Objections are always recorded regardless of confidence.
-        """
         meets_confidence = signals.confidence >= min_confidence
 
         if meets_confidence:
@@ -388,19 +324,7 @@ class ProspectState:
 
 @dataclass
 class Action:
-    """
-    Output of the decision engine: a concrete instruction for the agent.
 
-    type: what kind of move to make
-        "ASK_SLOT"          — probe for a specific qualification field
-        "HANDLE_OBJECTION"  — address the prospect's pushback
-        "CLOSE"             — attempt to book next step
-        "END"               — wrap up the call
-
-    slot: which field to probe (only set when type == "ASK_SLOT")
-    message_goal: short human-readable description of the move's intent
-    reason_codes: machine-readable list of reasons that led to this decision
-    """
     type: str  # "ASK_SLOT" | "HANDLE_OBJECTION" | "CLOSE" | "END"
     slot: str | None = None
     message_goal: str = ""
@@ -454,13 +378,7 @@ class TraceTurn:
 
 @dataclass
 class DecisionTrace:
-    """
-    Accumulates TraceTurns across the whole call for post-call explainability.
-
-    The trace answers "why did the agent do X on turn N?" by recording the
-    extracted signals, computed score, chosen action, and reason codes at
-    every step.
-    """
+    
     session_id: str = ""
     turns: list[TraceTurn] = field(default_factory=list)
     ended_reason: str | None = None

@@ -115,7 +115,7 @@ async def process_input(session_id: str, user_text: str) -> dict:
     )
 
     # --- 4. Recompute score ---
-    score_after = score_opportunity(state, signals)
+    score_after = score_opportunity(state)
     state.interest_score = score_after
 
     # --- 5. Decide next action ---
@@ -195,7 +195,7 @@ async def process_input(session_id: str, user_text: str) -> dict:
     save_session(session_id, state, trace)
 
     # --- 10. Finalize if the call is over ---
-    ended = action.type in ("END", "CLOSE")
+    ended = action.type == "END"
     outcome = None
     if ended:
         reason = action.reason_codes[0] if action.reason_codes else "agent_decision"
@@ -296,6 +296,10 @@ _CLOSE_TEXT = (
 )
 
 _END_TEXTS: dict[str, str] = {
+    "CLOSE_ACCEPTED": (
+        "Awesome, I'll get that set up and send you a calendar invite right away. "
+        "Really looking forward to showing you what we can do. Thanks so much for your time!"
+    ),
     "USER_ENDED": (
         "Totally understand. Thanks for taking the time to chat — "
         "I really appreciate it. Have a great rest of your day!"

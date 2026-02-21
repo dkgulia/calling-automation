@@ -35,7 +35,7 @@ from pipecat.transports.network.fastapi_websocket import (
     FastAPIWebsocketTransport,
 )
 
-from pipecat.frames.frames import InputAudioRawFrame, TranscriptionFrame
+from pipecat.frames.frames import TranscriptionFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 from app.core.logging import logger
@@ -43,34 +43,6 @@ from app.core.settings import settings
 from app.infra.pipecat.brain import BrainProcessor
 from app.usecases.run_simulation import OPENER
 
-
-class _DebugLogger(FrameProcessor):
-    """Logs every frame passing through for debugging audio pipeline."""
-
-    def __init__(self, label: str, **kwargs):
-        super().__init__(**kwargs)
-        self._label = label
-        self._audio_count = 0
-
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        if isinstance(frame, InputAudioRawFrame):
-            self._audio_count += 1
-            if self._audio_count <= 3 or self._audio_count % 100 == 0:
-                logger.info(
-                    "[%s] audio frame #%d: %d bytes, sr=%s, ch=%s",
-                    self._label,
-                    self._audio_count,
-                    len(frame.audio) if frame.audio else 0,
-                    getattr(frame, "sample_rate", "?"),
-                    getattr(frame, "num_channels", "?"),
-                )
-        elif isinstance(frame, TranscriptionFrame):
-            logger.info("[%s] transcription: \"%s\"", self._label, frame.text[:80])
-        else:
-            name = type(frame).__name__
-            if "Audio" not in name:  # don't spam output audio
-                logger.debug("[%s] frame: %s", self._label, name)
-        await self.push_frame(frame, direction)
 
 # RTVI bot-ready JSON payload
 _BOT_READY_JSON = json.dumps({
@@ -197,6 +169,7 @@ async def run_pipeline(websocket: WebSocket, session_id: str) -> None:
             smart_format=True,
             interim_results=True,
             vad_events=True,
+            utterance_end_ms="1500",
         ),
     )
 

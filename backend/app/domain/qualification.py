@@ -20,23 +20,14 @@ incrementally) so it's always consistent with the current state.
 
 from __future__ import annotations
 
-from app.domain.state import ExtractedSignals, ProspectState
+from app.domain.state import ProspectState
 
 # Objections that strongly indicate a weak lead
 _STRONG_OBJECTIONS = {"already_have_tool", "not_interested", "too_expensive"}
 _MILD_OBJECTIONS = {"send_email", "busy"}
 
 
-def score_opportunity(state: ProspectState, signals: ExtractedSignals) -> float:
-    """
-    Compute opportunity score (0-10) from current state and latest signals.
-
-    The score reflects how promising this prospect is based on everything
-    we've learned so far.  It is always recomputed from the full state,
-    not incrementally adjusted, to avoid drift.
-
-    Returns the clamped score as a float.
-    """
+def score_opportunity(state: ProspectState) -> float:
     score = 0.0
 
     # --- Pain ---
@@ -83,11 +74,7 @@ def score_opportunity(state: ProspectState, signals: ExtractedSignals) -> float:
 
 
 def score_breakdown(state: ProspectState) -> list[dict]:
-    """
-    Return an itemized list of scoring contributions.
 
-    Each item: {"field": str, "points": float, "reason": str}
-    """
     items: list[dict] = []
 
     pain = state.learned_fields.get("pain")
@@ -158,12 +145,12 @@ def score_breakdown(state: ProspectState) -> list[dict]:
 
 
 def score_opportunity_with_breakdown(
-    state: ProspectState, signals: ExtractedSignals
+    state: ProspectState,
 ) -> tuple[float, list[dict], str]:
     """
     Compute score and return (score, breakdown_items, explanation_text).
     """
-    score = score_opportunity(state, signals)
+    score = score_opportunity(state)
     items = score_breakdown(state)
     label = label_from_score(score)
 

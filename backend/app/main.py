@@ -1,5 +1,6 @@
 import asyncio
 import time
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,10 +12,24 @@ from app.infra.session_store import get_active_session_ids, get_session
 
 setup_logging()
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage background tasks across the app lifecycle."""
+    watchdog_task = asyncio.create_task(_silence_watchdog())
+    yield
+    watchdog_task.cancel()
+    try:
+        await watchdog_task
+    except asyncio.CancelledError:
+        pass
+
+
 app = FastAPI(
     title="Roister Cold-Call Simulation",
     version="0.3.0",
     description="Conversational cold-call simulation API with Pipecat voice + LLM",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -60,35 +75,20 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     # explicitly to allow send_bytes() in the on_connected handler.
     await websocket.accept()
 
-    # Debug: monitor raw WebSocket messages in background
-    import asyncio as _asyncio
-
-    original_receive = websocket.receive
-
-    _msg_count = 0
-
-    async def _logging_receive():
-        nonlocal _msg_count
-        msg = await original_receive()
-        _msg_count += 1
-        msg_type = msg.get("type", "?")
-        has_bytes = len(msg.get("bytes", b"")) if "bytes" in msg else 0
-        has_text = len(msg.get("text", "")) if "text" in msg else 0
-        if _msg_count <= 5 or _msg_count % 200 == 0:
-            logger.info(
-                "Session %s: raw WS msg #%d type=%s bytes=%d text=%d",
-                session_id, _msg_count, msg_type, has_bytes, has_text,
-            )
-        return msg
-
-    websocket.receive = _logging_receive  # type: ignore
-
     try:
         await run_pipeline(websocket, session_id)
     except WebSocketDisconnect:
         logger.info("Session %s: WebSocket disconnected by client", session_id)
     except Exception as e:
         logger.error("Session %s: pipeline error: %s", session_id, e, exc_info=True)
+    finally:
+        # Ensure the WebSocket is closed after the pipeline finishes so the
+        # frontend receives an onclose event and can fetch the outcome.
+        try:
+            await websocket.close(code=1000, reason="Pipeline finished")
+        except Exception:
+            pass
+        logger.info("Session %s: WebSocket handler exiting", session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +124,3 @@ async def _silence_watchdog() -> None:
                 end_call(sid, state, trace, ended_reason="SILENCE_TIMEOUT")
 
 
-@app.on_event("startup")
-async def _start_watchdog():
-    asyncio.create_task(_silence_watchdog())

@@ -59,7 +59,7 @@ def main() -> None:
         state.update_from_signals(signals)
 
         # 4. Recompute score
-        score_after = score_opportunity(state, signals)
+        score_after = score_opportunity(state)
         state.interest_score = score_after
 
         # 5. Decide next action
